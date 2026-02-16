@@ -1,20 +1,17 @@
 """
 Gym Posture Corrector – Streamlit Frontend
 ============================================
-A clean, real-time dashboard that captures webcam video, sends frames
-to the Flask backend for pose analysis, and displays corrective
-feedback along with rep counts.
+Opens webcam, streams frames to the FastAPI backend /analyze_frame
+endpoint, and displays knee angle + posture verdict in real time.
 """
 
 import streamlit as st
 import cv2
-import base64
 import requests
 import numpy as np
-from datetime import datetime
 
 # ── Configuration ───────────────────────────────────────────────
-BACKEND_URL = "http://localhost:5000"
+BACKEND_URL = "http://localhost:8000"
 
 st.set_page_config(
     page_title="Gym Posture Corrector",
@@ -27,183 +24,141 @@ st.markdown("""
 <style>
     .main-header {
         text-align: center;
-        padding: 1rem 0;
+        padding: 1.5rem 0 0.5rem;
     }
+    .main-header h1 { font-size: 2.4rem; margin-bottom: 0.2rem; }
+    .main-header p  { opacity: 0.7; font-size: 1.1rem; }
+
     .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 12px;
-        padding: 1.2rem;
+        border-radius: 14px;
+        padding: 1.4rem 1rem;
         color: white;
         text-align: center;
-        margin-bottom: 0.8rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.15);
     }
-    .metric-card h2 { margin: 0; font-size: 2.2rem; }
-    .metric-card p  { margin: 0; opacity: 0.85; }
-    .feedback-good {
-        background: #d4edda; border-left: 4px solid #28a745;
-        padding: 0.6rem 1rem; border-radius: 4px; margin: 0.3rem 0;
-    }
-    .feedback-warn {
-        background: #fff3cd; border-left: 4px solid #ffc107;
-        padding: 0.6rem 1rem; border-radius: 4px; margin: 0.3rem 0;
-    }
+    .metric-card h2 { margin: 0; font-size: 2.6rem; font-weight: 700; }
+    .metric-card p  { margin: 0.3rem 0 0; opacity: 0.85; font-size: 0.95rem; }
+
+    .card-angle    { background: linear-gradient(135deg, #667eea, #764ba2); }
+    .card-correct  { background: linear-gradient(135deg, #11998e, #38ef7d); }
+    .card-incorrect{ background: linear-gradient(135deg, #eb3349, #f45c43); }
+    .card-no-pose  { background: linear-gradient(135deg, #636e72, #b2bec3); }
 </style>
 """, unsafe_allow_html=True)
-
-
-# ── Sidebar ─────────────────────────────────────────────────────
-def sidebar():
-    st.sidebar.image(
-        "https://img.icons8.com/emoji/96/000000/person-lifting-weights.png",
-        width=80,
-    )
-    st.sidebar.title("⚙️ Settings")
-
-    # Fetch available exercises
-    exercises = ["bicep_curl", "shoulder_press", "squat", "deadlift", "lateral_raise"]
-    try:
-        resp = requests.get(f"{BACKEND_URL}/exercises", timeout=3)
-        if resp.ok:
-            exercises = resp.json().get("exercises", exercises)
-    except requests.ConnectionError:
-        st.sidebar.warning("⚠️ Backend not reachable – using defaults.")
-
-    selected = st.sidebar.selectbox(
-        "Exercise",
-        exercises,
-        format_func=lambda x: x.replace("_", " ").title(),
-    )
-
-    if st.sidebar.button("Set Exercise"):
-        try:
-            requests.post(
-                f"{BACKEND_URL}/exercise",
-                json={"exercise": selected},
-                timeout=3,
-            )
-            st.sidebar.success(f"Exercise set to **{selected.replace('_',' ').title()}**")
-        except requests.ConnectionError:
-            st.sidebar.error("Could not reach backend.")
-
-    if st.sidebar.button("🔄 Reset Counters"):
-        try:
-            requests.post(f"{BACKEND_URL}/reset", timeout=3)
-            st.sidebar.info("Counters reset.")
-        except requests.ConnectionError:
-            st.sidebar.error("Could not reach backend.")
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"Session started: {datetime.now():%H:%M:%S}")
-    return selected
-
-
-# ── Helpers ─────────────────────────────────────────────────────
-def encode_frame(frame: np.ndarray) -> str:
-    """Encode an OpenCV BGR frame as a base64 JPEG data-URI."""
-    _, buf = cv2.imencode(".jpg", frame)
-    b64 = base64.b64encode(buf).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-def render_feedback(feedback_list: list[str]):
-    """Render feedback messages with styled HTML."""
-    for msg in feedback_list:
-        css_class = "feedback-good" if "✅" in msg else "feedback-warn"
-        st.markdown(f'<div class="{css_class}">{msg}</div>', unsafe_allow_html=True)
 
 
 # ── Main ────────────────────────────────────────────────────────
 def main():
     st.markdown(
-        '<div class="main-header"><h1>🏋️ Gym Posture Corrector</h1>'
-        "<p>Real-time AI-powered form feedback for your workouts</p></div>",
+        '<div class="main-header">'
+        "<h1>🏋️ Gym Posture Corrector</h1>"
+        "<p>Real-time AI-powered squat form feedback</p>"
+        "</div>",
         unsafe_allow_html=True,
     )
-
-    exercise = sidebar()
 
     col_video, col_stats = st.columns([3, 1])
 
     with col_stats:
         st.subheader("📊 Live Stats")
-        reps_placeholder = st.empty()
-        stage_placeholder = st.empty()
         angle_placeholder = st.empty()
-        feedback_placeholder = st.empty()
+        posture_placeholder = st.empty()
+        info_placeholder = st.empty()
 
     with col_video:
         run = st.checkbox("▶️  Start Camera", value=False)
         frame_display = st.empty()
 
-    if run:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Cannot access webcam. Check your camera settings.")
-            return
+    if not run:
+        st.info("Toggle **Start Camera** above to begin real-time analysis.")
+        return
 
-        while run:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Frame capture failed.")
-                break
+    # Open webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("❌ Cannot access webcam. Check your camera settings.")
+        return
 
-            # Send frame to backend
-            try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/analyze",
-                    json={"frame": encode_frame(frame)},
-                    timeout=5,
-                )
-                data = resp.json()
-            except Exception as exc:
-                frame_display.image(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    channels="RGB",
-                    use_container_width=True,
-                )
-                feedback_placeholder.warning(f"Backend error: {exc}")
-                continue
+    while run:
+        ret, frame = cap.read()
+        if not ret:
+            st.warning("Frame capture failed — retrying …")
+            continue
 
-            # Show annotated frame
-            if data.get("annotated_frame"):
-                frame_display.image(
-                    data["annotated_frame"],
-                    use_container_width=True,
-                )
-            else:
-                frame_display.image(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    channels="RGB",
-                    use_container_width=True,
-                )
+        # Encode frame as JPEG bytes for upload
+        success, buf = cv2.imencode(".jpg", frame)
+        if not success:
+            continue
 
-            # Update stats
-            reps_placeholder.markdown(
-                f'<div class="metric-card"><h2>{data.get("reps", 0)}</h2>'
-                f"<p>Reps</p></div>",
+        # Send to backend /analyze_frame as a file upload
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/analyze_frame",
+                files={"file": ("frame.jpg", buf.tobytes(), "image/jpeg")},
+                timeout=5,
+            )
+            data = resp.json()
+        except Exception as exc:
+            # Show raw frame and an error message
+            frame_display.image(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                channels="RGB",
+                use_container_width=True,
+            )
+            info_placeholder.warning(f"⚠️ Backend error: {exc}")
+            continue
+
+        # ── Display the webcam frame ─────────────────────────────
+        frame_display.image(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            channels="RGB",
+            use_container_width=True,
+        )
+
+        # ── Handle errors from backend ───────────────────────────
+        if "error" in data:
+            angle_placeholder.markdown(
+                '<div class="metric-card card-no-pose">'
+                "<h2>—</h2><p>Knee Angle</p></div>",
                 unsafe_allow_html=True,
             )
-            stage_placeholder.markdown(
-                f'<div class="metric-card"><h2>{(data.get("stage") or "–").upper()}</h2>'
-                f"<p>Stage</p></div>",
+            posture_placeholder.markdown(
+                '<div class="metric-card card-no-pose">'
+                "<h2>—</h2><p>Posture</p></div>",
                 unsafe_allow_html=True,
             )
+            info_placeholder.info(f"ℹ️ {data['error']}")
+            continue
 
-            # Angles
-            angles = data.get("angles", {})
-            if angles:
-                angle_str = " | ".join(
-                    f"**{k.replace('_',' ').title()}**: {v}°" for k, v in angles.items()
-                )
-                angle_placeholder.markdown(angle_str)
+        # ── Update live metrics ──────────────────────────────────
+        knee_angle = data.get("knee_angle", "—")
+        posture = data.get("posture", "—")
 
-            # Feedback
-            with feedback_placeholder.container():
-                render_feedback(data.get("feedback", []))
+        # Knee angle card
+        angle_placeholder.markdown(
+            f'<div class="metric-card card-angle">'
+            f"<h2>{knee_angle}°</h2><p>Knee Angle</p></div>",
+            unsafe_allow_html=True,
+        )
 
-        cap.release()
-    else:
-        st.info("Toggle **Start Camera** to begin real-time analysis.")
+        # Posture card (green = correct, red = incorrect)
+        if posture == "Correct":
+            card_cls = "card-correct"
+            icon = "✅"
+        else:
+            card_cls = "card-incorrect"
+            icon = "❌"
+
+        posture_placeholder.markdown(
+            f'<div class="metric-card {card_cls}">'
+            f"<h2>{icon} {posture}</h2><p>Posture</p></div>",
+            unsafe_allow_html=True,
+        )
+
+        info_placeholder.empty()
+
+    cap.release()
 
 
 if __name__ == "__main__":
