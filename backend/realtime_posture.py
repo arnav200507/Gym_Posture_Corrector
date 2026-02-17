@@ -1,62 +1,76 @@
 """
 realtime_posture.py
-===================
-Standalone real-time squat posture analyser.
-Captures webcam video, detects pose via MediaPipe, calculates the
-knee angle, determines squat correctness, counts reps, and overlays
-all information on the live video feed.
-
-Press 'q' to quit.
+Real-time squat posture analyser with side dashboard UI and session logging.
 """
 
 import cv2
+import json
 import numpy as np
 from pose_detector import detect_pose
 from angle_utils import calculate_angle
 
-# ── MediaPipe landmark indices ──────────────────────────────────
 LEFT_HIP = 23
 LEFT_KNEE = 25
 LEFT_ANKLE = 27
 
-# ── Squat thresholds ────────────────────────────────────────────
-SQUAT_CORRECT_LOW = 70      # knee angle lower bound for "Correct"
-SQUAT_CORRECT_HIGH = 100    # knee angle upper bound for "Correct"
-STANDING_THRESHOLD = 160    # angle above which we consider the person standing
+SQUAT_CORRECT_LOW = 70
+SQUAT_CORRECT_HIGH = 100
+STANDING_THRESHOLD = 160
 
 
-def draw_overlay(frame, knee_angle, posture, reps, stage):
-    """Draw a translucent info panel on the top-left of the frame."""
-    overlay = frame.copy()
+def save_session_stats(reps):
+    data = {"total_reps": reps}
+    with open("session_stats.json", "w") as f:
+        json.dump(data, f)
 
-    # Semi-transparent dark rectangle
-    cv2.rectangle(overlay, (0, 0), (350, 200), (30, 30, 30), cv2.FILLED)
-    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    # Colours
-    green = (0, 230, 118)
-    red = (70, 70, 255)
+def draw_dashboard(frame, knee_angle, posture, reps, stage):
+    h, w, _ = frame.shape
+    panel_width = 350
+
+    dashboard = np.zeros((h, w + panel_width, 3), dtype=np.uint8)
+    dashboard[:, :w] = frame
+
+    cv2.rectangle(dashboard, (w, 0), (w + panel_width, h), (25, 25, 25), -1)
+
     white = (255, 255, 255)
-    cyan = (255, 220, 0)
+    green = (0, 255, 120)
+    red = (0, 0, 255)
+    yellow = (255, 220, 0)
 
-    posture_colour = green if posture == "Correct" else red
+    posture_color = green if posture == "Correct" else red
 
-    # Text lines
-    cv2.putText(frame, f"Knee Angle: {knee_angle:.1f} deg",
-                (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, cyan, 2)
-    cv2.putText(frame, f"Posture: {posture}",
-                (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.85, posture_colour, 2)
-    cv2.putText(frame, f"Reps: {reps}",
-                (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.85, white, 2)
-    cv2.putText(frame, f"Stage: {stage}",
-                (15, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.7, white, 2)
+    # Suggestion logic
+    if posture == "Incorrect":
+        suggestion = "Go lower / bend knees more"
+    else:
+        suggestion = "Good posture"
 
-    return frame
+    cv2.putText(dashboard, "POSTURE DASHBOARD", (w + 20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, white, 2)
+
+    cv2.putText(dashboard, f"Knee Angle: {knee_angle:.1f}", (w + 20, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, white, 2)
+
+    cv2.putText(dashboard, f"Posture: {posture}", (w + 20, 170),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, posture_color, 2)
+
+    cv2.putText(dashboard, f"Reps: {reps}", (w + 20, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, white, 2)
+
+    cv2.putText(dashboard, f"Stage: {stage}", (w + 20, 270),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, white, 2)
+
+    cv2.putText(dashboard, "Suggestion:", (w + 20, 340),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, white, 2)
+
+    cv2.putText(dashboard, suggestion, (w + 20, 390),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, yellow, 2)
+
+    return dashboard
 
 
 def draw_landmarks(frame, landmarks):
-    """Draw key joint connections on the frame for visual feedback."""
-    # Connections to draw: hip → knee → ankle
     joints = [LEFT_HIP, LEFT_KNEE, LEFT_ANKLE]
     points = [(landmarks[j]["x"], landmarks[j]["y"]) for j in joints]
 
@@ -70,68 +84,57 @@ def draw_landmarks(frame, landmarks):
 
 def main():
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("ERROR: Cannot open webcam.")
-        return
 
     reps = 0
-    stage = "up"   # "up" = standing, "down" = squatting
+    stage = "up"
 
-    print("Real-time Squat Posture Analyser")
-    print("Press 'q' to quit.\n")
+    cv2.namedWindow("Gym Posture Corrector", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Gym Posture Corrector",
+                          cv2.WND_PROP_FULLSCREEN,
+                          cv2.WINDOW_FULLSCREEN)
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame.")
             break
 
-        # Detect pose landmarks
+        frame = cv2.flip(frame, 1)
+
         landmarks = detect_pose(frame)
 
-        if landmarks is None:
-            # No person detected — show a message
-            cv2.putText(frame, "No person detected",
-                        (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0, (0, 0, 255), 2)
-            cv2.imshow("Gym Posture Corrector", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-            continue
+        knee_angle = 0
+        posture = "No Person"
 
-        # Extract key joint coordinates
-        hip = [landmarks[LEFT_HIP]["x"], landmarks[LEFT_HIP]["y"]]
-        knee = [landmarks[LEFT_KNEE]["x"], landmarks[LEFT_KNEE]["y"]]
-        ankle = [landmarks[LEFT_ANKLE]["x"], landmarks[LEFT_ANKLE]["y"]]
+        if landmarks is not None:
+            hip = [landmarks[LEFT_HIP]["x"], landmarks[LEFT_HIP]["y"]]
+            knee = [landmarks[LEFT_KNEE]["x"], landmarks[LEFT_KNEE]["y"]]
+            ankle = [landmarks[LEFT_ANKLE]["x"], landmarks[LEFT_ANKLE]["y"]]
 
-        # Calculate knee angle
-        knee_angle = calculate_angle(hip, knee, ankle)
+            knee_angle = calculate_angle(hip, knee, ankle)
 
-        # Determine posture
-        posture = "Correct" if SQUAT_CORRECT_LOW <= knee_angle <= SQUAT_CORRECT_HIGH else "Incorrect"
+            posture = "Correct" if SQUAT_CORRECT_LOW <= knee_angle <= SQUAT_CORRECT_HIGH else "Incorrect"
 
-        # ── Rep counting logic ──────────────────────────────────
-        # DOWN stage: knee angle drops into the correct squat range
-        if knee_angle <= SQUAT_CORRECT_HIGH:
-            stage = "down"
+            if knee_angle <= SQUAT_CORRECT_HIGH:
+                stage = "down"
 
-        # UP stage: knee angle returns above the standing threshold ⇒ 1 rep
-        if knee_angle >= STANDING_THRESHOLD and stage == "down":
-            stage = "up"
-            reps += 1
+            if knee_angle >= STANDING_THRESHOLD and stage == "down":
+                stage = "up"
+                reps += 1
 
-        # ── Draw visuals ────────────────────────────────────────
-        draw_landmarks(frame, landmarks)
-        frame = draw_overlay(frame, knee_angle, posture, reps, stage)
+            draw_landmarks(frame, landmarks)
 
-        cv2.imshow("Gym Posture Corrector", frame)
+        display_frame = draw_dashboard(frame, knee_angle, posture, reps, stage)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow("Gym Posture Corrector", display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print(f"\nSession finished. Total reps: {reps}")
+
+    save_session_stats(reps)
+    print(f"Session finished. Total reps: {reps}")
 
 
 if __name__ == "__main__":
